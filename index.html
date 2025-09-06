@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Lung Capacity Estimator</title>
+    <!-- 1. Import the Chart.js library -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            text-align: center;
+            background-color: #f0f2f5;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 20px auto;
+            background: #ffffff;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        h1 { color: #1a2533; }
+        p { color: #555; }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            margin: 10px;
+            border-radius: 8px;
+            border: none;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+        button:disabled { background-color: #c0c0c0; cursor: not-allowed; }
+        #startBtn { background-color: #28a745; }
+        #stopBtn { background-color: #dc3545; }
+        #uploadBtn { background-color: #007bff; }
+        form { margin-top: 20px; }
+        input { padding: 12px; border-radius: 8px; border: 1px solid #ccc; width: 80%; margin-bottom: 10px; }
+        audio { margin-top: 20px; width: 100%; }
+        #result { font-size: 20px; font-weight: bold; margin-top: 20px; color: #004085; }
+        /* Style for the chart container */
+        #chartContainer {
+            margin-top: 30px;
+            width: 100%;
+            height: 300px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>Lung Capacity Estimator 🌬️</h1>
+        <p>Enter your details, click Start, breathe out steadily, then click Stop.</p>
+        
+        <div>
+            <button id="startBtn">Start Recording</button>
+            <button id="stopBtn" disabled>Stop Recording</button>
+        </div>
+        <audio id="player" controls></audio>
+        
+        <form>
+            <input type="text" id="nameInput" placeholder="👤 Your Name" required><br>
+            <input type="text" id="genderInput" placeholder="Gender (m/f)" required><br>
+            <input type="number" id="ageInput" placeholder="Age" required><br>
+            <input type="number" id="heightInput" placeholder="Height (inches)" required><br>
+            <button type="button" id="uploadBtn" disabled>Upload & Analyze</button>
+        </form>
+        
+        <p id="result"></p>
+
+        <!-- 2. Add a canvas element for the chart -->
+        <div id="chartContainer">
+            <canvas id="breathChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        let mediaRecorder, audioChunks = [], audioBlob = null, breathChart = null;
+        // Variables for real-time audio monitoring
+        let audioContext, micSource, mediaStream;
+        
+        const startBtn = document.getElementById("startBtn");
+        const stopBtn = document.getElementById("stopBtn");
+        const uploadBtn = document.getElementById("uploadBtn");
+        const resultText = document.getElementById("result");
+        const player = document.getElementById("player");
+        const nameInput = document.getElementById("nameInput");
+        const genderInput = document.getElementById("genderInput");
+        const ageInput = document.getElementById("ageInput");
+        const heightInput = document.getElementById("heightInput");
+
+        startBtn.onclick = async () => {
+            try {
+                // Get the audio stream from the microphone
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaStream = stream; // Store the stream to stop it later
+
+                // --- NEW: REAL-TIME AUDIO MONITORING ---
+                audioContext = new AudioContext();
+                micSource = audioContext.createMediaStreamSource(stream);
+                micSource.connect(audioContext.destination); // Connect mic to speakers
+                // --- END OF NEW CODE ---
+
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+                mediaRecorder.start();
+                
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                resultText.textContent = "🎙 Recording... (You should hear your breath now)";
+            } catch (err) {
+                alert("⚠️ Could not access microphone. Please check browser permissions.");
+            }
+        };
+
+        stopBtn.onclick = () => {
+            mediaRecorder.stop();
+
+            // --- NEW: CLEANUP FOR REAL-TIME MONITORING ---
+            if (micSource) {
+                micSource.disconnect(); // Stop routing mic to speakers
+            }
+            if (audioContext) {
+                audioContext.close(); // Close the audio context
+            }
+            if (mediaStream) {
+                // This is important to turn off the microphone indicator in the browser
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            // --- END OF NEW CODE ---
+
+            mediaRecorder.onstop = () => {
+                audioBlob = new Blob(audioChunks, { type: "audio/wav" });
+                player.src = URL.createObjectURL(audioBlob);
+                stopBtn.disabled = true;
+                uploadBtn.disabled = false;
+                resultText.textContent = "Recording complete. Analyze to see results.";
+            };
+        };
+
+        // --- Client-Side Audio Processing and Charting ---
+        async function processAndDisplayAudio(blob) {
+            const localAudioContext = new AudioContext();
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioBuffer = await localAudioContext.decodeAudioData(arrayBuffer);
+            const rawData = audioBuffer.getChannelData(0);
+            
+            const frameSize = 1024;
+            const energyThreshold = 0.001;
+            let activeFrames = 0;
+            let totalEnergy = 0;
+            const plotPoints = [];
+
+            for (let i = 0; i < rawData.length; i += frameSize) {
+                const frame = rawData.slice(i, i + frameSize);
+                let frameEnergy = 0;
+                for (let j = 0; j < frame.length; j++) {
+                    frameEnergy += frame[j] * frame[j];
+                }
+                frameEnergy /= frame.length;
+                
+                if (frameEnergy > energyThreshold) {
+                    activeFrames++;
+                    totalEnergy += frameEnergy;
+                }
+                plotPoints.push(frameEnergy * 1000);
+            }
+
+            const activeTime = (activeFrames * frameSize) / audioBuffer.sampleRate;
+            const averageEnergy = activeFrames > 0 ? totalEnergy / activeFrames : 0;
+            
+            drawBreathChart(plotPoints);
+
+            return { activeTime, averageEnergy };
+        }
+
+        function drawBreathChart(energyData) {
+            const ctx = document.getElementById('breathChart').getContext('2d');
+            const labels = energyData.map((_, i) => (i * 1024 / 44100).toFixed(2));
+
+            if (breathChart) {
+                breathChart.destroy();
+            }
+
+            breathChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Your Breath Energy',
+                        data: energyData,
+                        borderColor: 'rgb(0, 122, 255)',
+                        backgroundColor: 'rgba(0, 122, 255, 0.1)',
+                        tension: 0.3,
+                        fill: true,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { title: { display: true, text: 'Time (s)' } },
+                        y: { title: { display: true, text: 'Energy (Scaled)' }, min: 0 }
+                    }
+                }
+            });
+        }
+
+        uploadBtn.onclick = async () => {
+            if (!audioBlob) return alert("⚠️ Please record first.");
+            
+            resultText.textContent = "⏳ Analyzing...";
+            
+            const { activeTime, averageEnergy } = await processAndDisplayAudio(audioBlob);
+
+            const formData = new FormData();
+            formData.append("gender", genderInput.value);
+            formData.append("age", ageInput.value);
+            formData.append("height", heightInput.value);
+            formData.append("activeTime", activeTime);
+            formData.append("averageEnergy", averageEnergy);
+            
+            fetch("http://127.0.0.1:5000/upload", {
+                method: "POST",
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data && data.result) {
+                    resultText.textContent = data.result;
+                } else {
+                    resultText.textContent = "⚠️ No result received.";
+                }
+            })
+            .catch(err => {
+                resultText.textContent = "❌ Upload failed.";
+                alert("❌ Could not connect to server.");
+            });
+        };
+    </script>
+</body>
+</html>
