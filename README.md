@@ -22,6 +22,19 @@ Client → LoadBalancer (IP Whitelist) → Envoy Proxy Pod → Cilium Policy →
 
 ## 2. Configuration Files
 
+Each tenant's config is stored in `tenants/<tenant-short>/` (e.g., `tenants/lbpolicy3/`).
+
+```
+tenants/
+├── lbpolicy3/
+│   ├── envoy-gateway-tenant.yaml
+│   ├── envoy-gateway-policies.yaml
+│   └── update-default-isolation.yaml
+├── lbpolicy4/
+│   ├── envoy-gateway-tenant.yaml
+│   ├── ...
+```
+
 | File | Purpose |
 |---|---|
 | `envoy-gateway-tenant.yaml` | **Core infrastructure.** `EnvoyProxy` (resource limits, `externalTrafficPolicy: Cluster`, IP whitelist), `GatewayClass`, `Gateway`, `HTTPRoute`. |
@@ -49,6 +62,8 @@ Client → LoadBalancer (IP Whitelist) → Envoy Proxy Pod → Cilium Policy →
 ---
 
 ## 4. First-Time Installation
+
+> **Automated Option:** Run `bash deploy-envoy-tenant.sh` after creating the tenant via UI. It handles Steps 3–7 automatically (auto-detects settings, generates YAMLs into `tenants/<name>/`, deletes Cilium Gateway, deploys, and verifies).
 
 ### Step 1: Install Envoy Gateway Controller
 ```bash
@@ -94,9 +109,9 @@ kubectl delete gateway <CILIUM_GATEWAY_NAME> -n <TENANT_NAMESPACE>
 
 ### Step 6: Deploy
 ```bash
-kubectl apply -f envoy-gateway-tenant.yaml
-kubectl apply -f envoy-gateway-policies.yaml
-kubectl apply -f update-default-isolation.yaml
+kubectl apply -f tenants/<TENANT_SHORT>/envoy-gateway-tenant.yaml
+kubectl apply -f tenants/<TENANT_SHORT>/envoy-gateway-policies.yaml
+kubectl apply -f tenants/<TENANT_SHORT>/update-default-isolation.yaml
 ```
 
 ### Step 7: Verify
@@ -114,14 +129,15 @@ curl -k https://<YOUR_DOMAIN>/
 ## 5. Re-Deployment (After Namespace/Cluster Reset)
 
 Follow **Steps 2–7** from Section 4 above. If the entire cluster was reset, also do **Step 1** first.
+Existing tenant configs are preserved in `tenants/<name>/` — just re-apply them.
 
 ---
 
 ## 6. Operational Commands
 
 **Add/Remove an IP from Whitelist:**
-1.  Edit `loadBalancerSourceRanges` in `envoy-gateway-tenant.yaml`.
-2.  Run: `kubectl apply -f envoy-gateway-tenant.yaml`
+1.  Edit `loadBalancerSourceRanges` in `tenants/<TENANT_SHORT>/envoy-gateway-tenant.yaml`.
+2.  Run: `kubectl apply -f tenants/<TENANT_SHORT>/envoy-gateway-tenant.yaml`
 
 **Check Current Whitelist:**
 ```bash
