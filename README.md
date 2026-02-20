@@ -6,12 +6,14 @@ Cilium v1.19's native Gateway API uses a shared Envoy daemonset and does not sup
 
 | Layer | Component | Role |
 |---|---|---|
-| **L7 Ingress** | Envoy Gateway | Dedicated Envoy Proxy per tenant: TLS termination, HTTP routing, resource limits |
+| **DNS / CDN** | Cloudflare | DDoS protection, CDN, optional TLS termination |
+| **L3 Firewall** | `loadBalancerSourceRanges` | Blocks unauthorized IPs at the cloud LB level |
+| **L7 Ingress** | Envoy Gateway | Dedicated Envoy proxy per tenant: TLS termination, HTTP routing, IP filtering by real client IP |
 | **L3/L4 Security** | Cilium | Network policies between Envoy pods and backend pods |
 
 **Traffic Flow:**
 ```
-Client → LoadBalancer (IP Whitelist) → Envoy Proxy Pod → Cilium Policy → Backend Pod
+Client → Cloudflare (optional) → OVH LB (L3 filter) → Node (SNAT) → Envoy Proxy (L7 filter) → Cilium → Backend Pod
 ```
 
 **Namespace Layout:**
@@ -20,50 +22,211 @@ Client → LoadBalancer (IP Whitelist) → Envoy Proxy Pod → Cilium Policy →
 
 ---
 
-## 2. Configuration Files
+## 2. Deployment Scenarios
+
+### Scenario A — Cloudflare Proxy ON + Let's Encrypt
+
+```
+Client (1.2.3.4)
+  │ HTTPS to Cloudflare edge (104.21.x.x)
+  ▼
+Cloudflare Edge
+  │ Adds: X-Forwarded-For: 1.2.3.4
+  │ Adds: CF-Connecting-IP: 1.2.3.4
+  │ Opens new connection to your server (46.105.x.x)
+  ▼
+OVH LB — loadBalancerSourceRanges CHECK
+  │ Source IP is Cloudflare (e.g., 173.245.48.5) → ALLOWED ✅
+  ▼
+Kubernetes Node — SNAT
+  │ Cloudflare IP → 10.168.0.60 (node's own internal IP)
+  ▼
+Envoy Pod
+  │ Sees source: 10.168.0.60 → in trustedCIDRs → reads XFF header
+  │ Extracts real client IP: 1.2.3.4
+  │ SecurityPolicy: Is 1.2.3.4 in clientCIDRs? → YES ✅ → 200 OK
+```
+
+**Security layers active:** Cloudflare WAF → L3 firewall → L7 SecurityPolicy (real IP enforced)
+
+---
+
+### Scenario B — Cloudflare Proxy OFF + Let's Encrypt
+
+```
+Client (1.2.3.4)
+  │ HTTPS directly to server IP (46.105.x.x)
+  │ DNS resolves to your actual IP (not Cloudflare)
+  ▼
+OVH LB — loadBalancerSourceRanges CHECK
+  │ Source IP is 1.2.3.4 → must be in the L3 whitelist → ALLOWED ✅
+  ▼
+Kubernetes Node — SNAT
+  │ Client IP (1.2.3.4) → 10.168.0.60 (node's own internal IP)
+  │ Real client IP is LOST here (no Cloudflare to preserve it via XFF)
+  ▼
+Envoy Pod
+  │ Sees source: 10.168.0.60 → in trustedCIDRs → looks for XFF → none found
+  │ Falls back to: client IP = 10.168.0.60
+  │ SecurityPolicy: Is 10.168.0.60 in 10.168.0.0/16? → YES ✅ → 200 OK
+```
+
+**Security layers active:** L3 firewall only (L7 sees node IP due to SNAT — node subnet is allowed by design)
+
+> **Why is this safe?** `10.168.0.0/16` is a private range unreachable from the internet. Any packet that arrives via SNAT has already been pre-screened by `loadBalancerSourceRanges`. The SecurityPolicy node-subnet entry simply acknowledges what L3 already approved.
+
+---
+
+### Scenario C — Cloudflare Proxy ON (Origin Certificate)
+
+Identical flow to Scenario A. The only difference is the TLS connection **between Cloudflare and your server**:
+
+| | Scenario A (LE) | Scenario C (Origin Cert) |
+|---|---|---|
+| Client → Cloudflare TLS | Cloudflare's own cert | Cloudflare's own cert |
+| Cloudflare → Your Server TLS | Let's Encrypt cert (publicly trusted) | Cloudflare Origin cert (only CF trusts it) |
+| Bypass protection | L3 only | TLS handshake fails if attacker bypasses CF |
+
+Origin certificates add defense-in-depth: even if someone discovers your server's real IP and bypasses Cloudflare, their TLS handshake fails because the Origin cert is not trusted by any browser or `curl`.
+
+---
+
+## 3. Generated Manifest Files
 
 Each tenant's config is stored in `tenants/<tenant-short>/` (e.g., `tenants/lbpolicy3/`).
 
 ```
 tenants/
 ├── lbpolicy3/
-│   ├── envoy-gateway-tenant.yaml
-│   ├── envoy-gateway-policies.yaml
-│   └── update-default-isolation.yaml
-├── lbpolicy4/
-│   ├── envoy-gateway-tenant.yaml
-│   ├── ...
+│   ├── envoy-gateway-tenant.yaml       # Core infra: EnvoyProxy, GatewayClass, Gateway, HTTPRoute
+│   ├── client-ip-whitelist.yaml        # L7 filtering: ClientTrafficPolicy + SecurityPolicy
+│   ├── envoy-gateway-policies.yaml     # Cilium: Envoy pod network policies
+│   └── update-default-isolation.yaml   # Cilium: Backend pod ingress from Envoy
 ```
 
-| File | Purpose |
-|---|---|
-| `envoy-gateway-tenant.yaml` | **Core infrastructure.** `EnvoyProxy` (resource limits, `externalTrafficPolicy: Cluster`, IP whitelist), `GatewayClass`, `Gateway`, `HTTPRoute`. |
-| `envoy-gateway-policies.yaml` | **Envoy pod security.** Cilium policies allowing Envoy → xDS controller, Envoy → backend, Envoy → DNS. |
-| `update-default-isolation.yaml` | **Backend pod security.** Cilium policy allowing ingress from Envoy pods into the tenant namespace. |
+### `envoy-gateway-tenant.yaml`
 
-> **Note:** `service-whitelist.yaml` is **no longer needed**. IP whitelisting is now managed permanently in the `EnvoyProxy` CRD inside `envoy-gateway-tenant.yaml`.
+Contains 4 resources applied to the cluster:
+
+#### 1. `EnvoyProxy` — Envoy pod configuration
+```yaml
+kind: EnvoyProxy
+spec:
+  provider:
+    kubernetes:
+      envoyDeployment:
+        replicas: 2              # Two Envoy pods for HA
+        container:
+          resources:             # Per-tenant CPU/memory limits
+      envoyService:
+        externalTrafficPolicy: Cluster   # MUST be Cluster for multi-node compatibility
+        loadBalancerSourceRanges:        # L3 FIREWALL — OVH LB drops everything else
+          - 173.245.48.0/20             # Cloudflare IPs (always included)
+          - ...                         # Your whitelisted custom IPs
+  telemetry:
+    accessLog:                   # Logs: method, path, code, XFF, CF-Connecting-IP
+```
+> `externalTrafficPolicy: Cluster` allows traffic to reach an Envoy pod on any node, but causes SNAT — which is why `loadBalancerSourceRanges` (not Cilium `fromCIDR`) is used for L3 filtering.
+
+#### 2. `GatewayClass` — Links to Envoy Gateway controller
+```yaml
+kind: GatewayClass
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    name: albpolicytest-proxy    # Points to the EnvoyProxy above
+```
+
+#### 3. `Gateway` — Listens on ports 80/443, configures TLS
+```yaml
+kind: Gateway
+spec:
+  listeners:
+    - name: http                 # Port 80 — HTTP
+    - name: https                # Port 443 — TLS termination with your cert
+      tls:
+        certificateRefs:
+          - name: <tls-secret>   # Let's Encrypt or Cloudflare Origin cert secret
+```
+
+#### 4. `HTTPRoute` — Routes traffic to backend service
+```yaml
+kind: HTTPRoute
+spec:
+  hostnames: ["yourdomain.incubera.xyz"]
+  rules:
+    - backendRefs:
+        - name: <backend-service>
+          port: 80
+```
 
 ---
 
-## 3. Critical Configuration Details
+### `client-ip-whitelist.yaml`
 
-### externalTrafficPolicy: Cluster
-- **Must be `Cluster`**, not `Local`. With `Local`, traffic hitting a node without an Envoy pod is silently dropped.
-- Configured permanently in `EnvoyProxy` → `envoyService.externalTrafficPolicy` so the controller does **not** revert it.
+Contains 2 resources for L7 IP filtering:
 
-### IP Whitelisting via loadBalancerSourceRanges
-- Since `Cluster` policy performs SNAT, Cilium's `fromCIDR` cannot see client IPs. Instead, we use `loadBalancerSourceRanges` on the Service itself.
-- Configured permanently in `EnvoyProxy` → `envoyService.loadBalancerSourceRanges`.
+#### 5. `ClientTrafficPolicy` — Real client IP extraction
+```yaml
+kind: ClientTrafficPolicy
+spec:
+  clientIPDetection:
+    xForwardedFor:
+      trustedCIDRs:
+        - 173.245.48.0/20   # All Cloudflare IPs — trusted to set XFF (proxy ON)
+        - ...
+        - 10.168.0.0/16     # Internal node subnet — trusted for SNAT path (proxy OFF)
+```
+Tells Envoy: *"If a packet's source IP is in these ranges, trust the `X-Forwarded-For` header to find the real client IP."* When there is no XFF (proxy OFF), Envoy falls back to the source IP (the node IP).
 
-### Envoy → xDS Controller Egress
-- Envoy pods **must** be able to reach the Envoy Gateway controller on ports `18000`/`18001` (xDS gRPC). Without this, Envoy has no listener config and refuses all connections.
-- Configured in `envoy-gateway-policies.yaml` → `gateway-allow-egress`.
+#### 6. `SecurityPolicy` — Enforce IP whitelist at L7
+```yaml
+kind: SecurityPolicy
+spec:
+  authorization:
+    defaultAction: Deny          # Default deny everything
+    rules:
+      - action: Allow
+        principal:
+          clientCIDRs:
+            - 51.77.216.8/32    # Your whitelisted public IPs (checked via XFF when CF proxy ON)
+            - ...
+            - 10.168.0.0/16     # Node subnet (CF proxy OFF — L3 already screened this)
+```
+Enforces who can actually reach the backend. When Cloudflare proxy is ON, the `clientCIDRs` are checked against the **real client IP** (extracted from XFF). When proxy is OFF, they are checked against the **node IP** (hence the node subnet entry).
+
+---
+
+### `envoy-gateway-policies.yaml`
+
+Cilium network policy for the **Envoy pod** in `envoy-gateway-system`:
+
+```yaml
+# Ingress: Envoy accepts traffic from its owning Gateway (the LB service)
+# Egress:
+#   - Port 18000/18001 → Envoy Gateway controller (xDS config stream, CRITICAL)
+#   - Port 80 → Backend pods in tenant namespace
+#   - Port 53 → kube-dns (DNS resolution)
+```
+Without the xDS egress rule, Envoy has no route/listener configuration and refuses all connections.
+
+---
+
+### `update-default-isolation.yaml`
+
+Cilium network policy for **backend pods** in the tenant namespace:
+
+```yaml
+# Ingress: Allow traffic from Envoy pods (identified by gateway label + envoy-gateway-system namespace)
+# Egress: Allow to internet + kube-dns
+```
+Ensures backend pods only accept HTTP traffic from Envoy — not from any other pod or external source.
 
 ---
 
 ## 4. First-Time Installation
 
-> **Automated Option:** Run `bash deploy-envoy-tenant.sh` after creating the tenant via UI. It handles Steps 3–7 automatically (auto-detects settings, generates YAMLs into `tenants/<name>/`, deletes Cilium Gateway, deploys, and verifies).
+> **Automated:** Run `bash deploy-envoy-tenant.sh` after creating the tenant via the UI. The script handles Steps 3–8 automatically: prompts for inputs, auto-detects IPs, generates all YAMLs into `tenants/<name>/`, deletes the UI Cilium gateway, deploys, and verifies.
 
 ### Step 1: Install Envoy Gateway Controller
 ```bash
@@ -72,53 +235,45 @@ helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.3.0 \
 ```
 
 ### Step 2: Create Tenant via UI
-Create Org, Project, VPC, ALB, and Pods as usual via the Vishanti UI.
+Create Org, Project, VPC, ALB, and Pods as usual.
 
-### Step 3: Gather New Tenant Details
-Note down:
-- **Namespace**: e.g., `vishanti-lbpolicy3`
-- **Backend Service Name**: e.g., `backendpod3`
-- **Backend Label**: e.g., `app=backendpod3`
-- **Domain Name**: e.g., `lbpolicy3.incubera.xyz`
-- **TLS Secret Name**: e.g., `lbpolicy3-tls-secret`
+### Step 3: Delete UI-Created Gateway and HTTPRoute
 
-### Step 4: Update YAML Files
+The Vishanti UI creates a Cilium `Gateway` and `HTTPRoute` that hold the LoadBalancer IP. Delete them before applying the Envoy manifests.
 
-**`envoy-gateway-tenant.yaml`:**
-- `loadBalancerSourceRanges` → your allowed IPs
-- `Gateway.metadata.namespace` → tenant namespace
-- `certificateRefs.name` → TLS secret name (matches the one created by cert-manager)
-- `HTTPRoute.hostnames` → domain name
-- `HTTPRoute.backendRefs.name` → backend service name
-
-**`envoy-gateway-policies.yaml`:**
-- `app:` label → backend pod label
-- `io.kubernetes.pod.namespace:` → tenant namespace
-
-**`update-default-isolation.yaml`:**
-- `metadata.namespace` → tenant namespace
-- `endpointSelector.matchLabels.app:` → backend pod label
-
-### Step 5: Delete UI-Created Cilium Gateway
-The UI creates a Cilium Gateway that holds the LoadBalancer IP. Delete it to free the IP for Envoy.
 ```bash
-kubectl get gateway -n <TENANT_NAMESPACE>
-# Identify the one with class: cilium
-kubectl delete gateway <CILIUM_GATEWAY_NAME> -n <TENANT_NAMESPACE>
+TENANT_NS="vishanti-<tenant>"   # e.g., vishanti-lbpolicy3
+
+# List existing gateways and routes
+kubectl get gateway,httproute -n $TENANT_NS
+
+# Delete the UI-created Gateway (class: cilium) and its HTTPRoute
+kubectl delete gateway <CILIUM_GATEWAY_NAME> -n $TENANT_NS
+kubectl delete httproute <HTTPROUTE_NAME> -n $TENANT_NS
 ```
 
-### Step 6: Deploy
+> Deleting the Gateway releases the LoadBalancer IP so Envoy's Gateway can claim it.
+
+### Step 4: Apply Manifests
+
 ```bash
-kubectl apply -f tenants/<TENANT_SHORT>/envoy-gateway-tenant.yaml
-kubectl apply -f tenants/<TENANT_SHORT>/envoy-gateway-policies.yaml
-kubectl apply -f tenants/<TENANT_SHORT>/update-default-isolation.yaml
+TENANT_SHORT="<tenant-short>"   # e.g., lbpolicy3
+
+# Apply in order: core infra first, then policies
+kubectl apply -f tenants/$TENANT_SHORT/envoy-gateway-tenant.yaml
+kubectl apply -f tenants/$TENANT_SHORT/client-ip-whitelist.yaml
+kubectl apply -f tenants/$TENANT_SHORT/envoy-gateway-policies.yaml
+kubectl apply -f tenants/$TENANT_SHORT/update-default-isolation.yaml
 ```
 
-### Step 7: Verify
+### Step 5: Verify
+
 ```bash
-# Check Envoy service got the IP and correct config
+# Check Envoy service claimed the IP
 kubectl get svc -n envoy-gateway-system | grep envoy-vishanti
-kubectl get svc -n envoy-gateway-system <SVC_NAME> -o jsonpath='{.spec.externalTrafficPolicy}'
+
+# Check Gateway is programmed
+kubectl get gateway -n vishanti-$TENANT_SHORT
 
 # Test connectivity
 curl -k https://<YOUR_DOMAIN>/
@@ -128,194 +283,104 @@ curl -k https://<YOUR_DOMAIN>/
 
 ## 5. Re-Deployment (After Namespace/Cluster Reset)
 
-Follow **Steps 2–7** from Section 4 above. If the entire cluster was reset, also do **Step 1** first.
-Existing tenant configs are preserved in `tenants/<name>/` — just re-apply them.
+Follow Steps 2–3 from Section 4. If the entire cluster was reset, also do Step 1 first.
+Existing tenant configs are preserved in `tenants/<name>/` — the script re-applies them.
 
 ---
 
 ## 6. Operational Commands
 
-**Add/Remove an IP from Whitelist:**
-1.  Edit `loadBalancerSourceRanges` in `tenants/<TENANT_SHORT>/envoy-gateway-tenant.yaml`.
-2.  Run: `kubectl apply -f tenants/<TENANT_SHORT>/envoy-gateway-tenant.yaml`
-
-**Check Current Whitelist:**
+**View Envoy access logs** (shows real client IPs, XFF, CF-Connecting-IP):
 ```bash
-kubectl get svc -n envoy-gateway-system <SVC_NAME> -o jsonpath='{.spec.loadBalancerSourceRanges}'
+POD=$(kubectl get pod -n envoy-gateway-system \
+  -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl logs -n envoy-gateway-system $POD -c envoy -f
 ```
 
-**Check Access:**
+**Check current L3 whitelist (loadBalancerSourceRanges):**
 ```bash
-curl -k https://<YOUR_DOMAIN>/
+kubectl get svc -n envoy-gateway-system <SVC_NAME> \
+  -o jsonpath='{.spec.loadBalancerSourceRanges}'
+```
+
+**Check current L7 whitelist (SecurityPolicy):**
+```bash
+kubectl get securitypolicy <TENANT>-ip-whitelist -n vishanti-<TENANT> -o yaml
+```
+
+**Add an IP to SecurityPolicy (L7) on the fly:**
+```bash
+kubectl patch securitypolicy <TENANT>-ip-whitelist -n vishanti-<TENANT> \
+  --type=merge -p '{"spec":{"authorization":{"rules":[{"name":"allow-whitelisted-client-ips","action":"Allow","principal":{"clientCIDRs":["<IP1>/32","<IP2>/32","10.168.0.0/16"]}}]}}}'
+```
+
+**Check Cloudflare IP detected by Envoy:**
+```bash
+# Real client IP seen per request
+kubectl logs -n envoy-gateway-system $POD -c envoy | grep -v "10.168" | tail -20
 ```
 
 ---
 
 ## 7. Troubleshooting
 
-### Timeout / Cannot Connect
-1.  **Check IP whitelist**: Is your current public IP in `loadBalancerSourceRanges`?
-    ```bash
-    kubectl get svc -n envoy-gateway-system <SVC_NAME> -o jsonpath='{.spec.loadBalancerSourceRanges}'
-    ```
-2.  **Check `externalTrafficPolicy`**: Must be `Cluster`, not `Local`.
-    ```bash
-    kubectl get svc -n envoy-gateway-system <SVC_NAME> -o jsonpath='{.spec.externalTrafficPolicy}'
-    ```
+### `RBAC: access denied` (HTTP 403)
 
-### Connection Refused
-1.  **Check Envoy pod logs** for xDS timeout errors:
-    ```bash
-    kubectl logs -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest -c envoy --tail=20
-    ```
-2.  If you see `gRPC config stream to xds_cluster closed: connection timeout`:
-    - The `gateway-allow-egress` policy is missing the rule allowing Envoy → controller (port 18000).
-    - Re-apply `envoy-gateway-policies.yaml` and restart Envoy pods.
+Your real client IP is not in the SecurityPolicy `clientCIDRs`.
+
+1. Check what IP Envoy sees for your requests:
+   ```bash
+   kubectl logs -n envoy-gateway-system $POD -c envoy --tail=10
+   ```
+2. The log format is: `"METHOD PATH PROTO" CODE FLAGS BYTES_IN BYTES_OUT MS "XFF" "CF-CONNECTING-IP"`
+3. Patch the SecurityPolicy to add your IP (see Operational Commands above).
+
+### HTTP 522 (Cloudflare cannot connect to your server)
+
+Cloudflare's IPs are not in `loadBalancerSourceRanges`. The OVH LB is dropping Cloudflare's connections.
+
+```bash
+# Check L3 whitelist
+kubectl get svc -n envoy-gateway-system <SVC_NAME> -o jsonpath='{.spec.loadBalancerSourceRanges}'
+# Cloudflare IPs (173.245.48.0/20 etc.) must be present
+```
+
+### Connection Reset by Peer
+
+Envoy is expecting PROXY protocol headers but the LB is not sending them. Ensure `enableProxyProtocol` is **not** set in `ClientTrafficPolicy` (OVH does not support PROXY protocol via the standard annotation).
+
+### Timeout / Cannot Connect
+
+1. Check IP is in L3 whitelist:
+   ```bash
+   kubectl get svc -n envoy-gateway-system <SVC_NAME> -o jsonpath='{.spec.externalTrafficPolicy}'
+   # Should be: Cluster
+   ```
+2. Check `externalTrafficPolicy` is `Cluster` — if `Local`, packets to nodes without Envoy are dropped.
 
 ### 503 Service Unavailable
-- Envoy is running but can't reach the backend.
-- **Check policies**: Ensure `gateway-allow-egress` and `default-isolation` are applied.
-- **Check labels**: Verify backend pod labels match the policies (`app: backendpod3`).
+
+Envoy is running but can't reach the backend.
+- Check Cilium policies are applied: `kubectl get cnp -n envoy-gateway-system`
+- Check backend pod labels match: `kubectl get pods -n vishanti-<TENANT> --show-labels`
+
+### xDS timeout / No listeners (Connection Refused)
+
+```bash
+kubectl logs -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest \
+  -c envoy --tail=30 | grep -i "xds\|timeout\|grpc"
+```
+If you see `gRPC config stream closed`: re-apply `envoy-gateway-policies.yaml` — the egress rule to ports `18000`/`18001` is missing.
 
 ### LoadBalancer IP Pending
-- Another Gateway (usually the UI-created Cilium one) is holding the IP.
-- Delete the conflicting gateway: `kubectl delete gateway <NAME> -n <NAMESPACE>`
 
-### Gateway Not Programmed
-- Check controller: `kubectl get pods -n envoy-gateway-system`
-- Check logs: `kubectl logs -n envoy-gateway-system deployment/envoy-gateway`
-- Check TLS secret name matches: the Gateway `certificateRefs.name` must match the actual secret in the tenant namespace.
+Another Gateway (the UI-created Cilium one) is still holding the IP.
+```bash
+kubectl get gateway -n vishanti-<TENANT>
+kubectl delete gateway <CILIUM_GATEWAY_NAME> -n vishanti-<TENANT>
+```
 
 ### UI Shows "Failed" Status
-- **Expected.** The UI tracks the Cilium Gateway it created, which was deleted. The Envoy Gateway works independently. This is cosmetic only.
 
-
-# Vishanti Envoy Gateway Demo — Walkthrough & Talking Points
-
-So you're giving a demo. Here's exactly what to do and say.
-
-## Part 1: The Execution (What to do)
-
-### 1. **"Currently, we have..."** (Show existing state)
-- Show the UI. "I have a VPC, ALB, and Pod running for `lbpolicy4`."
-- Show the terminal. `kubectl get all -n vishanti-lbpolicy4`
-
-### 2. **"Let's simulate a new tenant."** (Delete & Recreate)
-- **Action**: Delete the existing VPC, Project, ALB, and Pods for `lbpolicy4` in the UI.
-- **Action**: Create them again in the UI (VPC → Project → ALB → Pods).
-- **Say**: "I'm provisioning a fresh tenant environment. The platform automatically creates the namespace, backend service, and TLS certificates."
-
-### 3. **"Now, the Magic Script."** (Deploy Envoy Gateway)
-- **Say**: "We need to deploy a dedicated Envoy Gateway for this tenant with specific security policies."
-- **Action**: Run the script:
-  ```bash
-  bash deploy-envoy-tenant.sh
-  ```
-- **Walkthrough**:
-  - Point out it *auto-detects* the new namespace (`vishanti-lbpolicy4`).
-  - Point out it *auto-detects* the backend service and TLS secret.
-  - **Select "Cloudflare Origin" (Option 1)**: Explain that this uses strict mTLS with Cloudflare.
-  - **IP Whitelist**: "I'm whitelisting Cloudflare's IPs automatically + my custom IP."
-  - **Deploy**: Watch it apply the YAMLs and delete the conflicting Cilium Gateway.
-  
-### 4. **"Verification."**
-- The script finishes with a green "Deployment Complete!" block.
-- **Action**: `curl -k https://albpolicy4.incubera.xyz` (or whatever domain).
-- **Say**: "The dedicated gateway is live and serving traffic."
-
----
-
-## Part 2: The Explanation (What to explain)
-
-When they ask: **"What did that script actually do? What are these YAML files?"**
-
-You answer: **"We are deploying a dedicated L7 Gateway per tenant, secured by Cilium at L3/L4."**
-
-Here are the 3 key files the script generated:
-
-### 1. `envoy-gateway-tenant.yaml` (The Infrastructure)
-> **"This defines the dedicated L7 proxy for the tenant."**
-
-- **EnvoyProxy CRD**:
-  - `replicas: 2`: High availability.
-  - `resources`: We set CPU/Memory limits *per tenant*. "Tenant A cannot starve Tenant B."
-  - `externalTrafficPolicy: Cluster`: Essential for LoadBalancer routing on bare metal.
-  - `loadBalancerSourceRanges`: **The Firewall.** This is where we whitelist Cloudflare IPs. "Traffic acts dropped if it's not from Cloudflare."
-- **Gateway & HTTPRoute**: Standard Kubernetes Gateway API. Connects the domain to your backend service.
-- **TLS**: Uses the **Cloudflare Origin Secret** we created. "Only Cloudflare can talk to this Gateway."
-
-### 2. `envoy-gateway-policies.yaml` (Envoy Security)
-> **"This secures the Envoy pods themselves using Cilium."**
-
-- **Egress Policy (`gateway-allow-egress`)**:
-  - "The Envoy proxy is locked down."
-  - It can *only* talk to:
-    1. The **Envoy Controller** (to get its config/xDS).
-    2. The **Tenant's Backend Pod** (and nothing else).
-    3. **DNS** (to resolve names).
-  - "If this Envoy pod is compromised, it cannot attack other tenants or the control plane."
-
-### 3. `update-default-isolation.yaml` (Backend Security)
-> **"This protects the application pods."**
-
-- **Ingress Policy (`default-isolation`)**:
-  - "The backend pod (`app=backendpod4`) refuses all traffic... EXCEPT from its own Envoy Gateway."
-  - "Even if another tenant's pod tries to call this service directly, Cilium drops the packet."
-  - This guarantees **Tenant Isolation**.
-
----
-
-## Part 3: "Why did we do it this way?" (FAQ)
-
-**Q: Why separate Envoy pods per tenant? Why not one shared Gateway?**
-**A:** "Noisy Neighbor problem. If Tenant A gets a DDoS attack or uses 100% CPU, a shared Gateway would crash for everyone. With dedicated pods, only Tenant A is affected. Tenant B is happy."
-
-**Q: Why `externalTrafficPolicy: Cluster`?**
-**A:** "For failover. If the node hosting the pod dies, traffic is routed to another node. We use `loadBalancerSourceRanges` on the Service to filter IPs because `Cluster` mode hides the client IP from Cilium's L3 policies."
-
----
-
-## Part 4: Deep Dive: The Security Policies (Ingress/Egress)
-
-This is the most critical part to explain if someone asks about security. Use these diagrams on a whiteboard or just talk through them.
-
-### 1. The Gateway's Egress Policy (`envoy-gateway-policies.yaml`)
-
-**Why:** By default, Envoy pods can talk to *anything* in the cluster. We want to lock that down.
-
-> **"This policy says: The Envoy Gateway pod is allowed to make OUTBOUND connections (Egress) ONLY to these three destinations. Everything else is BLOCKED."**
-
-```mermaid
-graph LR
-    Envoy[Envoy Pod] -->|Allowed| Controller[Envoy Controller <br> port 18000/18001]
-    Envoy -->|Allowed| Backend[Tenant Backend Pod <br> port 80/443]
-    Envoy -->|Allowed| DNS[Kube DNS <br> port 53]
-    Envoy -.->|BLOCKED| Database[Other Tenant DB]
-    Envoy -.->|BLOCKED| Internal[Internal API]
-```
-
-**Where in the YAML?**
-- `toEndpoints: matchLabels: control-plane: envoy-gateway` → Allows fetching config (xDS). **Crucial**: If you block this, Envoy fails to start.
-- `toEndpoints: matchLabels: app: backendpod4` → Allows forwarding traffic to the actual app.
-- `toEndpoints: matchLabels: k8s-app: kube-dns` → Allows resolving `backendpod4.vishanti-lbpolicy4.svc.cluster.local`.
-
----
-
-### 2. The Backend's Isolation Policy (`update-default-isolation.yaml`)
-
-**Why:** We don't want anyone else in the cluster (like another compromised pod) to talk to this tenant's backend.
-
-> **"This policy says: The Backend Pod is allowed to accept INBOUND connections (Ingress) ONLY from its own dedicated Envoy Gateway. Everything else is BLOCKED."**
-
-```mermaid
-graph TD
-    MyEnvoy[Tenant's Envoy Gateway] -->|Allowed| Backend[Backend Pod]
-    OtherPod[Other Tenant's Pod] -.->|BLOCKED| Backend
-    Hacker[Compromised Service] -.->|BLOCKED| Backend
-```
-
-**Where in the YAML?**
-- `ingress: fromEndpoints: matchLabels: gateway.envoyproxy.io/owning-gateway-name: albpolicytest`
-- This ensures **Zero Trust**. Even if you are inside the cluster, you cannot access the backend directly. You MUST go through the Gateway (which enforces TLS and WAF).
-
-
+**Expected.** The UI tracks the Cilium Gateway it created, which was deleted. The Envoy Gateway works independently. This is cosmetic only.
